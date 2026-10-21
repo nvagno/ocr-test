@@ -1,0 +1,2 @@
+Numérisation de mauvaise qualité avec du bruit.
+Les contours des lettres sont flous.

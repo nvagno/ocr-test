@@ -1,0 +1,2 @@
+Ce texte utilise une police de petite taille pour tester
+la robustesse de la détection sur des caractères fins.

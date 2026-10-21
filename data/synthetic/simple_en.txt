@@ -1,0 +1,2 @@
+The quick brown fox jumps over the lazy dog.
+Optical character recognition benchmark, sample 1.
