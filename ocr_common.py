@@ -3,8 +3,11 @@
 - chargement uniforme des entrées : images (png, jpg, ...) et PDF (pages rastérisées avec pypdfium2)
 - jeu de test synthétique avec vérité terrain (images + PDF multi-pages scanné)
 - métriques CER / WER
+- jeux de données Hugging Face : textes malgaches rendus en images, ou vraies images annotées
+- validation visuelle : image + boîtes détectées + texte lu, à côté de la vérité terrain
 - boucle de benchmark commune : chaque notebook ne fournit qu'une fonction `extract(image) -> str`
 """
+import html
 import json
 import platform
 import random
@@ -53,7 +56,10 @@ def load_document(path, dpi=200, max_pages=None):
     raise ValueError(f"Format non supporté : {path.suffix}")
 
 
-def list_inputs(dirs=(SYNTH_DIR, CUSTOM_DIR)):
+def list_inputs(dirs=None):
+    """Fichiers de test ; par défaut tous les sous-dossiers de data/ (synthetic, malagasy, hf_*, custom)."""
+    if dirs is None:
+        dirs = sorted(d for d in DATA_DIR.iterdir() if d.is_dir()) if DATA_DIR.exists() else []
     exts = IMAGE_EXTS | PDF_EXTS
     return sorted(p for d in dirs if Path(d).exists() for p in Path(d).iterdir() if p.suffix.lower() in exts)
 
@@ -153,12 +159,186 @@ def make_test_set(out_dir=SYNTH_DIR, overwrite=False):
     return list_inputs([out_dir])
 
 
+MALAGASY_DIR = DATA_DIR / "malagasy"
+
+MALAGASY_SAMPLES = {
+    "mg_ohabolana": (["Ny hevitra tsy iray tsy mahatanty hazo lena.",
+                      "Aza manao herim-boantay, fa ny hery tsy maharitra."], {}),
+    "mg_vaovao": (["Nivory teto Antananarivo omaly ireo solontenan'ny faritra enina amby roapolo.",
+                   "Nifanaraka izy ireo fa hotohizana ny fanamboarana ny lalana mankany Toamasina."], {"font_size": 28}),
+    "mg_faktiora": (["Faktiora laharana 2026-0458",
+                     "Vary 25 kg ............ 87 500 Ar",
+                     "Menaka 5 litatra ...... 42 000 Ar",
+                     "Totaliny ............. 129 500 Ar"], {}),
+    "mg_marika": (["Tsy tokony hatao ambanin-javatra ny fahasalamana.",
+                   "Toerana : Fianarantsoa, Mahajanga, Antsiranana, Toliara."], {"noise": True}),
+    "mg_mitongilana": (["Fanambarana ofisialy navoakan'ny minisitera.",
+                        "Ho an'ny mpianatra rehetra ao amin'ny oniversite."], {"rotate": 3}),
+}
+
+
+def make_malagasy_set(out_dir=MALAGASY_DIR, overwrite=False):
+    """5 images de phrases malgaches (proverbes, actualité, facture, bruit, rotation), sans réseau."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, (lines, opts) in MALAGASY_SAMPLES.items():
+        target = out_dir / f"{name}.png"
+        if target.exists() and not overwrite:
+            continue
+        img = _render(lines, font_size=opts.get("font_size", 32), width=opts.get("width", 1400))
+        if opts.get("rotate"):
+            img = img.rotate(opts["rotate"], expand=True, fillcolor="white")
+        if opts.get("noise"):
+            img = _noise(img)
+        img.save(target)
+        (out_dir / f"{name}.txt").write_text("\n".join(lines), encoding="utf-8")
+    return list_inputs([out_dir])
+
+
+def _slug(name):
+    return re.sub(r"[^\w.-]+", "_", name)
+
+
+def load_hf_text_dataset(repo="Lo-Renz-O/malagasy-sentence", column="text", split="train", n=8,
+                         min_chars=40, max_chars=280, malagasy_only=True, seed=0, overwrite=False):
+    """Prend n textes d'un dataset HF (texte seul) et les rend en images avec vérité terrain.
+
+    Par défaut : phrases malgaches réelles (aucun dataset OCR malgache image + texte n'existe sur le Hub).
+    Les images sont écrites dans data/hf_<repo>/ ; une variante sur trois est bruitée, une sur trois inclinée.
+    `malagasy_only` écarte les textes contenant c, q, u, w ou x (absents de l'alphabet malgache) : le corpus
+    contient aussi des phrases en français.
+    """
+    import textwrap
+
+    from datasets import load_dataset
+
+    out_dir = DATA_DIR / f"hf_{_slug(repo)}"
+    if out_dir.exists() and any(out_dir.glob("*.png")) and not overwrite:
+        return list_inputs([out_dir])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ds = load_dataset(repo, split=split, streaming=True).shuffle(seed=seed, buffer_size=2000)
+    i = 0
+    for row in ds:
+        text = re.sub(r"\s+", " ", str(row[column])).strip()
+        if not (min_chars <= len(text) <= max_chars):
+            continue
+        if malagasy_only and re.search(r"[cquwx]", text, re.I):
+            continue
+        lines = textwrap.wrap(text, 60)
+        img = _render(lines, font_size=30, width=1300)
+        if i % 3 == 1:
+            img = _noise(img, seed=i)
+        elif i % 3 == 2:
+            img = img.rotate(2, expand=True, fillcolor="white")
+        img.save(out_dir / f"{i:03d}.png")
+        (out_dir / f"{i:03d}.txt").write_text("\n".join(lines), encoding="utf-8")
+        i += 1
+        if i >= n:
+            break
+    return list_inputs([out_dir])
+
+
+def load_hf_image_dataset(repo="Teklia/IAM-line", split="test", image_column="image", text_column="text", n=5,
+                          overwrite=False):
+    """Télécharge n vraies images annotées d'un dataset HF (image + texte) dans data/hf_<repo>/.
+
+    Par défaut : lignes manuscrites anglaises IAM (test difficile pour des modèles entraînés sur l'imprimé).
+    Mettre text_column=None si le dataset n'a pas de vérité terrain.
+    """
+    from datasets import load_dataset
+
+    out_dir = DATA_DIR / f"hf_{_slug(repo)}"
+    if out_dir.exists() and any(out_dir.glob("*.png")) and not overwrite:
+        return list_inputs([out_dir])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, row in enumerate(load_dataset(repo, split=split, streaming=True)):
+        if i >= n:
+            break
+        row[image_column].convert("RGB").save(out_dir / f"{i:03d}.png")
+        if text_column:
+            (out_dir / f"{i:03d}.txt").write_text(str(row[text_column]), encoding="utf-8")
+    return list_inputs([out_dir])
+
+
+# --------------------------------------------------------------------------- visualisation
+
+
+def html_to_text(text):
+    """Texte lisible à partir d'une sortie HTML (Surya) : retours à la ligne conservés, balises supprimées."""
+    text = re.sub(r"<br\s*/?>|</(p|div|li|tr|h\d)>", "\n", text or "", flags=re.I)
+    return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+
+
+def _as_polygon(box):
+    """Accepte [x0, y0, x1, y1] ou [[x, y], ...] (liste, tuple ou numpy) et renvoie [[x, y], ...]."""
+    pts = [list(map(float, p)) if hasattr(p, "__len__") else float(p) for p in box]
+    if pts and not isinstance(pts[0], list):
+        x0, y0, x1, y1 = pts[:4]
+        return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    return pts
+
+
+def show_dataset(files, cols=4, width=4):
+    """Grille de vignettes (1re page de chaque fichier) pour vérifier ce qui sera testé."""
+    import matplotlib.pyplot as plt
+
+    files = list(files)
+    rows = max(1, -(-len(files) // cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * width, rows * width * 0.45), squeeze=False)
+    for ax in axes.flat:
+        ax.axis("off")
+    for ax, path in zip(axes.flat, files):
+        ax.imshow(load_document(path, dpi=72, max_pages=1)[0])
+        ax.set_title(f"{path.parent.name}/{path.name}", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+
+def show_result(image, text, boxes=None, ref=None, title=""):
+    """Image avec les boîtes détectées (gauche) et texte lu vs vérité terrain (droite)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+
+    fig, (ax_img, ax_txt) = plt.subplots(1, 2, figsize=(16, max(3, 7 * image.height / image.width)),
+                                         gridspec_kw={"width_ratios": [1.2, 1]})
+    ax_img.imshow(image)
+    for box in boxes or []:
+        ax_img.add_patch(Polygon(_as_polygon(box), closed=True, fill=False, edgecolor="red", linewidth=1.2))
+    ax_img.axis("off")
+    head = f"{title} — {len(boxes or [])} zones"
+    if ref is not None:
+        head += f" — CER {cer(ref, text):.1%}"
+    ax_img.set_title(head, fontsize=10)
+    ax_txt.axis("off")
+    body = "SORTIE\n" + (text or "(vide)")[:1500]
+    if ref is not None:
+        body = "RÉFÉRENCE\n" + ref[:700] + "\n\n" + body
+    ax_txt.text(0, 1, body, va="top", ha="left", fontsize=9, family="DejaVu Sans", wrap=True,
+                transform=ax_txt.transAxes)
+    plt.tight_layout()
+    plt.show()
+
+
+def visual_check(predict, files, max_files=8):
+    """Applique `predict(image) -> (texte, boîtes)` à la 1re page de chaque fichier et affiche le résultat."""
+    for path in list(files)[:max_files]:
+        page = load_document(path, max_pages=1)[0]
+        try:
+            t = time.perf_counter()
+            text, boxes = predict(page)
+            dt = time.perf_counter() - t
+        except Exception as e:
+            print(f"{path.name} : ÉCHEC {type(e).__name__}: {e}")
+            continue
+        show_result(page, text, boxes, ref=ground_truth(path), title=f"{path.parent.name}/{path.name} ({dt:.1f}s)")
+
+
 # --------------------------------------------------------------------------- métriques
 
 
 def normalize(text):
     """Supprime la mise en forme (Markdown, HTML, LaTeX léger, DocTags) et normalise les espaces."""
-    text = unicodedata.normalize("NFC", text or "")
+    text = unicodedata.normalize("NFC", text or "").replace("’", "'").replace("‘", "'")
     text = re.sub(r"<loc_\d+>", " ", text)                # coordonnées DocTags
     text = re.sub(r"<[^>]+>", " ", text)                  # balises HTML / DocTags
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)      # images markdown
@@ -182,8 +362,10 @@ def wer(ref, hyp):
 
 
 def hardware():
-    import torch
-
+    try:
+        import torch
+    except ImportError:  # notebooks Paddle / API : pas de torch
+        return f"{platform.processor() or platform.machine()} (torch absent)"
     if torch.cuda.is_available():
         return f"CUDA {torch.cuda.get_device_name(0)}"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
